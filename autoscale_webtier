@@ -1,1 +1,220 @@
+heat_template_version: 2015-04-30
 
+description: Simple template to demonstrate auto-scaling instances running web services
+
+#parameters:
+  #<param name>:
+    #type: <string | number | json | comma_delimited_list | boolean>
+    #label: <human-readable name of the parameter>
+    #description: <description of the parameter>
+    #default: <default value for parameter>
+    #hidden: <true | false>
+    #constraints:
+    #  <parameter constraints>
+    #immutable: <true | false>
+parameters:
+  key_name:
+    type: string
+    label: Key Name
+    description: Name of key-pair to be used for compute instance
+    hidden: false
+    default: VMwareOpenStack
+  image_ubuntu-default:
+    type: string
+    label: Image ID
+    description: Image to be used for compute instance
+    default: ubuntu-14.04-server-amd64
+    hidden: false
+  instance_type:
+    type: string
+    label: Instance Type
+    description: Type of instance (flavor) to be used
+	  default: m1.small
+    hidden: false
+    constraints:
+      - allowed_values: [ m1.small, m1.medium, m1.large ]
+        description: Value must be one of m1.small, m1.medium, m1.large.
+  external_network_id:
+    type: string
+    label: External Network ID
+    description: UUID of a Neutron external network
+    default: 78f79268-2808-415b-b523-1db7fd3624c5
+  dns_nameservers:
+    type: string
+    label: DNS Name Servers
+    description: Comma separated list of DNS nameservers
+    default: 208.67.222.222,208.67.220.220
+  #database_password:
+    #type: string
+    #label: Database Password
+    #description: Password to be used for database
+    #hidden: true
+    #constraints:
+      #- length: { min: 6, max: 8 }
+        #description: Password length must be between 6 and 8 characters.
+      #- allowed_pattern: "[a-zA-Z0-9]+"
+        #description: Password must consist of characters and numbers only.
+      #- allowed_pattern: "[A-Z]+[a-zA-Z0-9]*"
+        #description: Password must start with an uppercase character.
+
+#resources:
+  #<resource ID>:
+    #type: <resource type>
+    #properties:
+      #<property name>: <property value>
+    #metadata:
+      #<resource specific metadata>
+    #depends_on: <resource ID or list of ID>
+    #update_policy: <update policy>
+    #deletion_policy: <deletion policy>
+resources:
+  # Create the logical network and enable DHCP.
+  network_tier01:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: network_tier01
+  subnet_tier01:
+    type: OS::Neutron::Subnet
+    properties:
+      name: subnet_tier01
+      cidr: 192.168.10.0/24
+      dns_nameservers: { get_param: dns_nameservers}      
+      enable_dhcp: true
+      gateway_ip: 192.168.10.1
+      network_id: { get_resource: network_tier01 }
+  # Create the router, add internal network interface, and set router gateway
+  workload_router01:
+    type: OS::Neutron::Router
+    properties:
+      admin_state_up: true
+      name: workload_router01
+      value_specs: {router_type: exclusive}
+  workload_router01_gw:
+    type: OS::Neutron::RouterGateway
+    properties:
+      network_id: {get_param: external_network_id}
+      router_id: { get_resource: workload_router01}
+  workload_router_int0:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: workload_router01}
+      subnet_id: { get_resource: subnet_tier01}
+  # Create the workload security group
+  securitygroup_tier01:
+     type: OS::Neutron::SecurityGroup
+     properties:
+       description: Allow Unrestricted Inbound HTTP and SSH
+       name: securitygroup_tier01
+       rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+  # Create port(s) on logical network.
+  server01_netport0:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: network_tier01}
+      security_groups:
+        - { get_resource: securitygroup_tier01}
+  server01_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: {get_param: external_network_id}
+      port_id: { get_resource: server01_netport0}
+ server02_netport0:
+    type: OS::Neutron::Port
+    properties:
+      admin_state_up: true
+      network_id: { get_resource: network_tier01}
+      security_groups:
+        - { get_resource: securitygroup_tier01}
+  server02_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: {get_param: external_network_id}
+      port_id: { get_resource: server02_netport0}
+ #Create the instances and start application services
+  server01:
+    type: OS::Nova::Server
+    properties:
+      name: server01
+      image: { get_param: image_ubuntu-default }
+      flavor: m1.small
+      networks:
+        - port: { get_resource: server01_netport0 }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash
+            echo This is Web Server-01 >> file.txt
+            python -m SimpleHTTPServer 80
+  server02:
+    type: OS::Nova::Server
+    properties:
+      name: server02
+      image: { get_param: image_ubuntu-default }
+      flavor: m1.small
+      networks:
+        - port: { get_resource: server02_netport0 }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash
+            echo This is Web Server-02 >> file.txt
+            python -m SimpleHTTPServer 80
+  # Deploy the load-balancer service to the exclusive router
+  health_monitor01:
+    type: OS::Neutron::HealthMonitor
+    properties:
+      type: TCP
+      delay: 10
+      max_retries: 5
+      timeout: 10
+  server_pool01:
+    type: OS::Neutron::Pool
+    depends_on: workload_router_int0
+    properties:
+      name: server_pool01
+      protocol: HTTP
+      monitors: [{get_resource: health_monitor01}]
+      subnet_id: {get_resource:  subnet_tier01}
+      lb_method: ROUND_ROBIN
+      vip:
+        protocol_port: 80
+  loadbalancer01:
+    type: OS::Neutron::LoadBalancer
+    properties:
+      members: [ { get_resource: server01 }, { get_resource: server02 } ]
+      protocol_port: 80
+      pool_id: { get_resource: server_pool01 }
+  lb01_floatingip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: external_network_id }
+      port_id: { get_attr: [ server_pool01, vip, port_id ] }
+#outputs:
+  #<parameter name>:
+    #description: <description>
+    #value: <parameter value>
+outputs:
+  workload_detail:
+    description: The Public URL
+    value:
+      str_replace:
+        template: http://lb01_vip/file.txt
+        params:
+          lb01_vip: { get_attr: [ lb01_floatingip, floating_ip_address ] }
+	lb01vip_ip:
+    description: Load-Balancer Virtual IP
+    value: { get_attr: [ lb_floating, floating_ip_address ] }
+  server01_publicip:
+    description: Floating IP address of server 01 in public network
+    value: { get_attr: [ server01_floating_ip, floating_ip_address ] }
+  server02_publicip:
+    description: Floating IP address of server 02 in public network
+    value: { get_attr: [ server02_floating_ip, floating_ip_address ] }
